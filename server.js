@@ -6,9 +6,9 @@ dotenv.config();
 
 const app = express();
 
-/* ==============================
-   ENV
-============================== */
+// ==============================
+// ENV
+// ==============================
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const N8N_WEBHOOK = process.env.N8N_WEBHOOK;
@@ -20,61 +20,67 @@ if (!TELEGRAM_TOKEN || !N8N_WEBHOOK) {
 
 const TG_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-/* ==============================
-   BODY PARSERS
-============================== */
-app.use(express.json({ limit: "100mb" }));
-app.use(express.urlencoded({ extended: true, limit: "100mb" }));
+// ==============================
+// BODY PARSERS
+// ==============================
+app.use(express.json({ limit: "100mb" })); // for JSON payloads
+app.use(express.urlencoded({ extended: true, limit: "100mb" })); // for form-data
 
-/* ==============================
-   HEALTH CHECK
-============================== */
-app.get("/", (_, res) => {
+// ==============================
+// HEALTH CHECK
+// ==============================
+app.get("/", (req, res) => {
   res.send("Telegram Gateway is running ✅");
 });
 
-/* ==============================
-   UNIVERSAL STREAMING PROXY
-   (Telegram ↔ n8n safe)
-============================== */
+// ==============================
+// GENERIC PROXY (FOR N8N)
+// ==============================
 app.all("/proxy", async (req, res) => {
   try {
     const { url, method = "GET", headers = {}, body } = req.body || {};
+
     if (!url) return res.status(400).json({ error: "Missing url" });
 
-    const tgRes = await fetch(url, {
+    const response = await fetch(url, {
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
     });
 
-    // 🔥 Forward ALL important headers
-    const contentType = tgRes.headers.get("content-type");
-    const contentDisposition = tgRes.headers.get("content-disposition");
-    const contentLength = tgRes.headers.get("content-length");
+    const contentType = response.headers.get("content-type") || "";
 
-    if (contentType) res.setHeader("Content-Type", contentType);
-    if (contentDisposition) res.setHeader("Content-Disposition", contentDisposition);
-    if (contentLength) res.setHeader("Content-Length", contentLength);
+    // JSON
+    if (contentType.includes("application/json")) {
+      return res.json(await response.json());
+    }
 
-    // 🚀 Stream raw response (NO buffering, NO conversion)
-    tgRes.body.pipe(res);
+    // Binary (images, documents, audio, video)
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Length", buffer.length);
+    return res.send(buffer);
+
   } catch (err) {
     console.error("❌ Proxy error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-/* ==============================
-   TELEGRAM → N8N
-============================== */
+// ==============================
+// TELEGRAM → N8N
+// Telegram webhook target
+// ==============================
 app.post("/telegram", async (req, res) => {
   try {
+    console.log("📩 Telegram update received");
+
     await fetch(N8N_WEBHOOK, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req.body),
     });
+
     res.status(200).send("OK");
   } catch (err) {
     console.error("❌ Telegram forward error:", err);
@@ -82,39 +88,45 @@ app.post("/telegram", async (req, res) => {
   }
 });
 
-/* ==============================
-   N8N → TELEGRAM (TEXT)
-============================== */
+// ==============================
+// N8N → TELEGRAM
+// Send text message
+// ==============================
 app.post("/send", async (req, res) => {
   try {
     const { chat_id, text } = req.body;
+
     if (!chat_id || !text) {
-      return res.status(400).json({ error: "chat_id and text required" });
+      return res.status(400).json({ error: "chat_id and text are required" });
     }
 
-    const r = await fetch(`${TG_API}/sendMessage`, {
+    const tgResponse = await fetch(`${TG_API}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id, text }),
     });
 
-    res.json(await r.json());
+    const data = await tgResponse.json();
+    res.json(data);
   } catch (err) {
+    console.error("❌ Telegram send error:", err);
     res.status(500).json({ error: "Telegram send failed" });
   }
 });
 
-/* ==============================
-   N8N → TELEGRAM (ANY FILE)
-============================== */
+// ==============================
+// N8N → TELEGRAM
+// Send any file type (photo, document, voice, audio, video, etc.)
+// ==============================
 app.post("/send-file", async (req, res) => {
   try {
     const { chat_id, type, file_url, caption } = req.body;
+
     if (!chat_id || !type || !file_url) {
-      return res.status(400).json({ error: "chat_id, type, file_url required" });
+      return res.status(400).json({ error: "chat_id, type, file_url are required" });
     }
 
-    const methods = {
+    const sendMethods = {
       photo: "sendPhoto",
       document: "sendDocument",
       audio: "sendAudio",
@@ -122,28 +134,62 @@ app.post("/send-file", async (req, res) => {
       video: "sendVideo",
     };
 
-    if (!methods[type]) {
-      return res.status(400).json({ error: `Unsupported type ${type}` });
+    if (!sendMethods[type]) {
+      return res.status(400).json({ error: `Unsupported type: ${type}` });
     }
 
-    const payload = { chat_id, [type]: file_url };
+    const payload = {
+      chat_id,
+      [type === "document" ? "document" : type]: file_url,
+    };
+
     if (caption) payload.caption = caption;
 
-    const r = await fetch(`${TG_API}/${methods[type]}`, {
+    const tgResponse = await fetch(`${TG_API}/${sendMethods[type]}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
-    res.json(await r.json());
+    const data = await tgResponse.json();
+    res.json(data);
   } catch (err) {
+    console.error("❌ Telegram send-file error:", err);
     res.status(500).json({ error: "Telegram send-file failed" });
   }
 });
 
-/* ==============================
-   START
-============================== */
+// ==============================
+// N8N → TELEGRAM
+// FILE DOWNLOAD (BINARY STREAM)
+// ==============================
+app.get("/telegram-file", async (req, res) => {
+  try {
+    const { file_path } = req.query;
+
+    if (!file_path) return res.status(400).send("Missing file_path");
+
+    const telegramFileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${file_path}`;
+
+    const tgResponse = await fetch(telegramFileUrl);
+
+    if (!tgResponse.ok) {
+      console.error("❌ Telegram file fetch failed");
+      return res.status(500).send("Failed to fetch file from Telegram");
+    }
+
+    res.setHeader("Content-Type", tgResponse.headers.get("content-type") || "application/octet-stream");
+    res.setHeader("Content-Disposition", "attachment");
+    tgResponse.body.pipe(res);
+  } catch (err) {
+    console.error("❌ File proxy error:", err);
+    res.status(500).send("File proxy error");
+  }
+});
+
+// ==============================
+// START SERVER
+// ==============================
 app.listen(PORT, () => {
-  console.log(`🚀 Telegram Gateway listening on ${PORT}`);
+  console.log(`🚀 Telegram Gateway listening on port ${PORT}`);
 });
